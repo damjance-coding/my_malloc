@@ -38,8 +38,6 @@ void* my_mremap(void* addr, unsigned long old_len, unsigned long new_leng, int f
     return ptr;
 }
 
-// Using 'volatile int' to ensure the compiler doesn't optimize away the checks
-
 static inline int atomic_xchg(spinlock *lock, int val) {
     int prev;
     __asm__ __volatile__ (
@@ -65,9 +63,14 @@ spinlock tiny_locks[NTINY]   = {0};
 spinlock small_locks[NSMALL] = {0};
 spinlock mid_locks[NMID]     = {0};
 
+
+static __thread thread_cache tcache_internal;
+
+#define tcache (&tcache_internal)
+
 object_metadata* carve_arena(void* arena,long arena_size, long obj_size) {
     long metadata_stride =  sizeof(object_metadata) + obj_size;
-    object_metadata* head = MY_NULL;
+    object_metadata* head = NULL;
     for(int i = 0; i < arena_size; i += metadata_stride) {
         object_metadata* obj = (object_metadata*)((char*)(arena) +i);
         
@@ -75,7 +78,7 @@ object_metadata* carve_arena(void* arena,long arena_size, long obj_size) {
         obj->status = FREE;
         if(!head) {
             head = obj;
-            obj->prev = MY_NULL;
+            obj->prev = NULL;
             obj->next = (object_metadata*)((char*)(arena) + i + metadata_stride);
         }
         else {
@@ -99,24 +102,24 @@ object_metadata* mid_bins[NMID] = {0};
 void* my_malloc(unsigned long size) {
     // 1. Sanity check
     if(size == 0) {
-        return MY_NULL;
+        return NULL;
     }
     // 2. Align size to 16 bytes
     size = ALIGN16(size);
 
     // 3. Check if the memory object needs to be allocated via mmap dirrectly
     if(size > MY_MMAP_TRESHOLD) {
-        object_metadata* lob = my_mmap(MY_NULL, sizeof(object_metadata) + size, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+        object_metadata* lob = my_mmap(NULL, sizeof(object_metadata) + size, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
         // LOB stands for Large OBject
         
         if(lob == MY_MAP_FAILED) {
-            return MY_NULL;
+            return NULL;
         }
 
         lob->size = size;
         lob->status = IN_USE;
-        lob->next = MY_NULL;
-        lob->prev = MY_NULL;
+        lob->next = NULL;
+        lob->prev = NULL;
 
         return (void*)(lob + 1);
     };
@@ -124,36 +127,73 @@ void* my_malloc(unsigned long size) {
     // 4. Handle allocations 16-512 bytes
     if(size <= TINY_END) {
         short idx = size / TINY_STRIDE - 1; // The increment between objects in the tiny_bin is 16b
-        spin_acquire(&tiny_locks[idx]);
-        object_metadata* sob = tiny_bins[idx];
-        // SOB stands for Small OBject
-        if(sob) {
-            
-            sob->status = IN_USE;
-            tiny_bins[idx] = sob->next;
-            spin_release(&tiny_locks[idx]);
-            return (void*)(sob + 1);
-        }
-        else {
-            spin_release(&tiny_locks[idx]);
-            void* arena= my_mmap(MY_NULL, TINY_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
-            
-            if(arena == MY_MAP_FAILED) {
-                return MY_NULL;
-            }
+        // Check the thread cache first (no need for a spinlock)
+        if(tcache->tiny_bins[idx]) {
+            object_metadata* sob = tcache->tiny_bins[idx];
 
-            object_metadata* head = carve_arena(arena, TINY_ARENA_SIZE, size);
-            
+            sob->status = IN_USE;
+            tcache->tiny_bins[idx] = sob->next;
+
+            tcache->tiny_counts[idx]--;
+
+            return (void*)(sob+1);
+        }
+
+        ///thread cache empty, take from tiny_bins[idx]
+        spin_acquire(&tiny_locks[idx]);
+        if(tiny_bins[idx]) {
+            for(int i = 0; i < TINY_BATCH_SIZE; i++) {
+                object_metadata* sob = tiny_bins[idx];
+                if(sob == NULL) break;
+
+                tiny_bins[idx] = sob->next; 
+                sob->next = tcache->tiny_bins[idx];
+
+                tcache->tiny_bins[idx] = sob;
+                
+            }
+            object_metadata* head = tcache->tiny_bins[idx];
 
             head->status = IN_USE;
+            tcache->tiny_bins[idx] = head->next;
 
-            spin_acquire(&tiny_locks[idx]);
-            tiny_bins[idx] = head->next;
+            tcache->tiny_counts[idx] = TINY_BATCH_SIZE -1;
+
             spin_release(&tiny_locks[idx]);
-
-            
             return (void*)(head + 1);
-        } 
+        
+        }
+
+        spin_release(&tiny_locks[idx]);
+        void* arena= my_mmap(NULL, TINY_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+        
+        if(arena == MY_MAP_FAILED) {
+            return NULL;
+        }
+
+        object_metadata* head = carve_arena(arena, TINY_ARENA_SIZE, size);
+        spin_acquire(&tiny_locks[idx]);
+        tiny_bins[idx] = head;
+
+        for(int i = 0; i < TINY_BATCH_SIZE; i++) {
+            object_metadata* sob = tiny_bins[idx];
+
+            if(sob == NULL) break;
+
+            tiny_bins[idx] = sob->next;
+
+            sob->next = tcache->tiny_bins[idx];
+            tcache->tiny_bins[idx] = sob;
+        }
+
+        tcache->tiny_counts[idx] = TINY_BATCH_SIZE;
+
+        head->status = IN_USE;
+        head->next = NULL;
+
+        spin_release(&tiny_locks[idx]);
+        return (void*)(head + 1);
+    
 
     }
 
@@ -161,32 +201,71 @@ void* my_malloc(unsigned long size) {
     else if (size <= SMALL_END) {
 
         short idx = size / SMALL_STRIDE - 1; // The increment between objects in the small_bin is 128b
-        spin_acquire(&small_locks[idx]);
-        object_metadata* sob = small_bins[idx];
-        if(sob) {
-            sob->status = IN_USE;
-            small_bins[idx] = sob->next;
-            spin_release(&small_locks[idx]);
+        
+        if(tcache->small_bins[idx]) {
+            object_metadata* sob = tcache->small_bins[idx];
+
+            tcache->small_bins[idx] = sob->next;
+            sob->status=IN_USE;
+
+            tcache->small_counts[idx]--;
 
             return (void*)(sob + 1);
         }
         else {
-            spin_release(&small_locks[idx]);
-            void* arena= my_mmap(MY_NULL, SMALL_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+            spin_acquire(&small_locks[idx]);
+            if(small_bins[idx]) {
+                for(int i = 0; i < SMALL_BATCH_SIZE; i++) {
+                    object_metadata* sob = small_bins[idx];
+                    if(sob == NULL) break;
+
+                    small_bins[idx] = sob-> next;
+
+                    sob->next = tcache->small_bins[idx];
+                    tcache->small_bins[idx] = sob;
+                }
+
+                object_metadata* head = tcache->small_bins[idx];
+                
+                tcache->small_bins[idx] = head->next;
+                head->status = IN_USE;
+
+                tcache->small_counts[idx] = SMALL_BATCH_SIZE -1;
+
+                spin_release(&small_locks[idx]);
+                return (void*)(head + 1);
             
+            }   
+
+            spin_release(&small_locks[idx]);
+            void* arena= my_mmap(NULL, SMALL_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+        
             if(arena == MY_MAP_FAILED) {
-                return MY_NULL;
+                return NULL;
             }
 
             object_metadata* head = carve_arena(arena, SMALL_ARENA_SIZE, size);
             
-            head->status = IN_USE;
-
             spin_acquire(&small_locks[idx]);
-            small_bins[idx] = head->next;
-            spin_release(&small_locks[idx]);
+            small_bins[idx] = head;
 
-            
+            for(int i = 0; i < SMALL_BATCH_SIZE; i++) {
+                object_metadata* sob = small_bins[idx];
+
+                if(sob == NULL) break;
+
+                small_bins[idx] = sob->next;
+
+                sob->next = tcache->small_bins[idx];
+                tcache->small_bins[idx] = sob;
+            }
+
+            tcache->small_counts[idx] = SMALL_BATCH_SIZE;
+
+            head->status = IN_USE;
+            head->next = NULL;
+
+            spin_release(&small_locks[idx]);
             return (void*)(head + 1);
         } 
     }
@@ -194,45 +273,83 @@ void* my_malloc(unsigned long size) {
     //6. Handle allocations 4KB - 128KB
     else if(size <= MID_END) {
         short idx = size / MID_STRIDE - 1; // The increment between objects in the mid_bin is 4kb
-        spin_acquire(&mid_locks[idx]);
-        object_metadata* sob = mid_bins[idx];
-        if(sob) {
+        
+        if(tcache->mid_bins[idx]) {
+            object_metadata* sob = tcache->mid_bins[idx];
+
             sob->status = IN_USE;
-            mid_bins[idx] = sob->next;
-            spin_release(&mid_locks[idx]);
+            tcache->mid_bins[idx] = sob->next;
+
+            tcache->mid_counts[idx]--;
 
             return (void*)(sob + 1);
         }
+        
+
         else {
+            spin_acquire(&mid_locks[idx]);
+            if(mid_bins[idx]) {
+                for(int i = 0; i < MID_BATCH_SIZE; i++) {
+                    object_metadata* sob = mid_bins[idx];
+                    if(sob == NULL) break;
+                    
+                    mid_bins[idx] = sob->next;
+                    
+                    sob->next = tcache->mid_bins[idx];
+                    tcache->mid_bins[idx] = sob;
+                }
+                object_metadata* head = tcache->mid_bins[idx];
+
+                head->status = IN_USE;
+                tcache->mid_bins[idx] = head->next;
+
+                tcache->mid_counts[idx] = MID_BATCH_SIZE - 1;
+
+                spin_release(&mid_locks[idx]);
+                return (void*)(head + 1);
+            }
+
             spin_release(&mid_locks[idx]);
-            void* arena= my_mmap(MY_NULL, MID_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+            void* arena= my_mmap(NULL, MID_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
             
             if(arena == MY_MAP_FAILED) {
-                return MY_NULL;
+                return NULL;
             }
 
             object_metadata* head = carve_arena(arena, MID_ARENA_SIZE, size);
-            
-            head->status = IN_USE;
             spin_acquire(&mid_locks[idx]);
-            mid_bins[idx] = head->next;
+            mid_bins[idx] = head;
+
+            for(int i = 0; i < MID_BATCH_SIZE; i++) {
+                object_metadata* sob = mid_bins[idx];
+
+                if(sob == NULL) break;
+
+                mid_bins[idx] = sob->next;
+
+                sob->next = tcache->mid_bins[idx];
+                tcache->mid_bins[idx] = sob;
+            }
+            tcache->mid_counts[idx] = MID_BATCH_SIZE;
+            head->status = IN_USE;
+            head->next = NULL;
+
             spin_release(&mid_locks[idx]);
-            
             return (void*)(head + 1);
         }
     }
 
-    return MY_NULL;
+    return NULL;
 }
 
 int my_free(void* ptr) {
 
-    if(ptr == MY_NULL) {
+    if(ptr == NULL) {
         return -1;
     }
     
     object_metadata* obj = get_object_ptr(ptr);
-    if(obj == MY_NULL) {
+    if(obj == NULL) {
         return -1;
     }
 
@@ -246,28 +363,67 @@ int my_free(void* ptr) {
     }
     else if (obj->size <= TINY_END) {
         short idx = obj->size / TINY_STRIDE - 1;
+        int count = tcache->tiny_counts[idx];
 
-        spin_acquire(&tiny_locks[idx]);
+        if(count >= TINY_BATCH_SIZE * 2) {
+            spin_acquire(&tiny_locks[idx]);
+            for(int i = 0; i < TINY_BATCH_SIZE * 2; i++){
+                object_metadata* sob = tcache->tiny_bins[idx];
+
+                tcache->tiny_bins[idx] = sob->next;
+
+                sob->next = tiny_bins[idx];
+                tiny_bins[idx] = sob;
+            }
+            spin_release(&tiny_locks[idx]);
+        }
+
         obj->status = FREE;
-        obj->next = tiny_bins[idx];
-        tiny_bins[idx] = obj;
-        spin_release(&tiny_locks[idx]);        
+        obj->next = tcache->tiny_bins[idx];
+        tcache->tiny_bins[idx] = obj;
     }
     else if (obj->size <= SMALL_END) {
         short idx = obj->size / SMALL_STRIDE - 1;
-        spin_acquire(&small_locks[idx]);
+
+        int count = tcache->small_counts[idx];
+        if(count >= SMALL_BATCH_SIZE * 2) {
+            spin_acquire(&small_locks[idx]);
+            for(int i = 0; i < SMALL_BATCH_SIZE * 2; i++){
+                object_metadata* sob = tcache->small_bins[idx];
+
+                tcache->small_bins[idx] = sob->next;
+
+                sob->next = small_bins[idx];
+                small_bins[idx] = sob;
+            }
+            spin_release(&small_locks[idx]);
+        }
+
         obj->status = FREE;
-        obj->next = small_bins[idx];
-        small_bins[idx] = obj;
-        spin_release(&small_locks[idx]);
+        obj->next = tcache->small_bins[idx];
+        tcache->small_bins[idx] = obj;
     }
     else if (obj->size <= MID_END) {
         short idx = obj->size / MID_STRIDE - 1;
-        spin_acquire(&mid_locks[idx]);
+        
+        
+        int count = tcache->mid_counts[idx];
+        if(count >= MID_BATCH_SIZE * 2) {
+            spin_acquire(&mid_locks[idx]);
+            for(int i = 0; i < MID_BATCH_SIZE * 2; i++){
+                object_metadata* sob = tcache->mid_bins[idx];
+
+                tcache->mid_bins[idx] = sob->next;
+
+                sob->next = mid_bins[idx];
+                mid_bins[idx] = sob;
+            }
+            spin_release(&mid_locks[idx]);
+        }
+
         obj->status = FREE;
-        obj->next = mid_bins[idx];
-        mid_bins[idx] = obj;
-        spin_release(&mid_locks[idx]);
+        obj->next = tcache->mid_bins[idx];
+        tcache->mid_bins[idx] = obj;
     }
     
     return 0;
@@ -276,7 +432,7 @@ int my_free(void* ptr) {
 void* my_calloc(unsigned long nmemb, unsigned long size) {
     unsigned long total_size = nmemb * size;
     if(nmemb == 0 || size == 0 || total_size / size != nmemb) {
-        return MY_NULL;
+        return NULL;
     }
     void* ptr = my_malloc(total_size);
 
@@ -292,20 +448,20 @@ void* my_calloc(unsigned long nmemb, unsigned long size) {
 }
 
 void* my_realloc(void* ptr, unsigned long new_size) {
-    if(ptr == MY_NULL) {
+    if(ptr == NULL) {
         return my_malloc(new_size);
     }
     if(new_size == 0) {
         my_free(ptr);
-        return MY_NULL;
+        return NULL;
     }
     new_size = ALIGN16(new_size);
     object_metadata* obj = get_object_ptr(ptr);
     if(obj->size > MY_MMAP_TRESHOLD) {
-        object_metadata* new_obj = my_mremap(MY_NULL, sizeof(object_metadata) + obj->size, sizeof(object_metadata) + new_size, MY_MREMAP_MAYMOVE);
+        object_metadata* new_obj = my_mremap(obj, sizeof(object_metadata) + obj->size, sizeof(object_metadata) + new_size, MY_MREMAP_MAYMOVE);
 
         if(new_obj == MY_MAP_FAILED){
-            return MY_NULL;
+            return NULL;
         }
 
         new_obj->size = new_size;
