@@ -83,7 +83,11 @@ object_metadata* carve_arena(void* arena,long arena_size, long obj_size) {
         }
         else {
             obj->prev = (object_metadata*)((char*)(arena) + i - metadata_stride);
-            obj->next = (object_metadata*)((char*)(arena) + i + metadata_stride);
+            if(i + metadata_stride >= arena_size) {
+                obj->next = NULL;
+            }else {
+                obj->next = (object_metadata*)((char*)(arena) + i + metadata_stride);
+            }
         }
         
 
