@@ -455,10 +455,6 @@ void* my_realloc(void* ptr, unsigned long new_size) {
     new_size = ALIGN16(new_size);
     object_metadata* obj = get_object_ptr(ptr);
 
-    if(obj->next != IN_USE) {
-        my_free(ptr);
-    }
-
     if(obj->size > MY_MMAP_TRESHOLD) {
         object_metadata* new_obj = my_mremap(obj, sizeof(object_metadata) + obj->size, sizeof(object_metadata) + new_size, MY_MREMAP_MAYMOVE);
 
