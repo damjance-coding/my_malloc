@@ -1,5 +1,4 @@
 #include "heap_internal.h"
-#include <stdio.h>
 
 void* my_mmap(void *addr, unsigned long len, int prot, int flags, int fd, long offest) {
     void *ptr;
@@ -74,14 +73,12 @@ object_metadata* carve_arena(void* arena, unsigned long arena_size, unsigned lon
         object_metadata* obj = (object_metadata*)((char*)(arena) +i);
         
         obj->size = obj_size; 
-        obj->status = FREE;
+
         if(!head) {
             head = obj;
-            obj->prev = NULL;
             obj->next = (object_metadata*)((char*)(arena) + i + metadata_stride);
         }
         else {
-            obj->prev = (object_metadata*)((char*)(arena) + i - metadata_stride);
             if(i + metadata_stride >= arena_size - metadata_stride) {
                 obj->next = NULL;
             }else {
@@ -120,9 +117,7 @@ void* my_malloc(unsigned long size) {
         }
 
         lob->size = size;
-        lob->status = IN_USE;
-        lob->next = NULL;
-        lob->prev = NULL;
+        lob->next = IN_USE;
 
         return (void*)(lob + 1);
     };
@@ -133,8 +128,9 @@ void* my_malloc(unsigned long size) {
         // Check the thread cache first (no need for a spinlock)
         if(tcache->tiny_bins[idx]) {
             object_metadata* sob = tcache->tiny_bins[idx];
-            sob->status = IN_USE;
+
             tcache->tiny_bins[idx] = sob->next;
+            sob->next = IN_USE; // next now representes the status, if it isnt IN_USE the object is free
 
             tcache->tiny_counts[idx]--;
 
@@ -151,19 +147,18 @@ void* my_malloc(unsigned long size) {
                 tiny_bins[idx] = sob->next; 
                 sob->next = tcache->tiny_bins[idx];
 
-                tcache->tiny_bins[idx] = sob;
-                
+                tcache->tiny_bins[idx] = sob;                
             }
+
             object_metadata* head = tcache->tiny_bins[idx];
 
-            head->status = IN_USE;
             tcache->tiny_bins[idx] = head->next;
+            head->next = IN_USE;
 
             tcache->tiny_counts[idx] = TINY_BATCH_SIZE -1;
 
             spin_release(&tiny_locks[idx]);
             return (void*)(head + 1);
-        
         }
 
         spin_release(&tiny_locks[idx]);
@@ -190,13 +185,10 @@ void* my_malloc(unsigned long size) {
 
         tcache->tiny_counts[idx] = TINY_BATCH_SIZE;
 
-        head->status = IN_USE;
-        head->next = NULL;
+        head->next = IN_USE;
 
         spin_release(&tiny_locks[idx]);
         return (void*)(head + 1);
-    
-
     }
 
     // 5. Handle allocations 528-4KB
@@ -208,7 +200,7 @@ void* my_malloc(unsigned long size) {
             object_metadata* sob = tcache->small_bins[idx];
 
             tcache->small_bins[idx] = sob->next;
-            sob->status=IN_USE;
+            sob->next = IN_USE;
 
             tcache->small_counts[idx]--;
 
@@ -230,7 +222,7 @@ void* my_malloc(unsigned long size) {
                 object_metadata* head = tcache->small_bins[idx];
                 
                 tcache->small_bins[idx] = head->next;
-                head->status = IN_USE;
+                head->next = IN_USE;
 
                 tcache->small_counts[idx] = SMALL_BATCH_SIZE -1;
 
@@ -264,8 +256,7 @@ void* my_malloc(unsigned long size) {
 
             tcache->small_counts[idx] = SMALL_BATCH_SIZE;
 
-            head->status = IN_USE;
-            head->next = NULL;
+            head->next = IN_USE;
 
             spin_release(&small_locks[idx]);
             return (void*)(head + 1);
@@ -279,8 +270,8 @@ void* my_malloc(unsigned long size) {
         if(tcache->mid_bins[idx]) {
             object_metadata* sob = tcache->mid_bins[idx];
 
-            sob->status = IN_USE;
             tcache->mid_bins[idx] = sob->next;
+            sob->next = IN_USE;
 
             tcache->mid_counts[idx]--;
 
@@ -302,8 +293,8 @@ void* my_malloc(unsigned long size) {
                 }
                 object_metadata* head = tcache->mid_bins[idx];
 
-                head->status = IN_USE;
                 tcache->mid_bins[idx] = head->next;
+                head->next = IN_USE;
 
                 tcache->mid_counts[idx] = MID_BATCH_SIZE - 1;
 
@@ -332,9 +323,9 @@ void* my_malloc(unsigned long size) {
                 sob->next = tcache->mid_bins[idx];
                 tcache->mid_bins[idx] = sob;
             }
+
             tcache->mid_counts[idx] = MID_BATCH_SIZE;
-            head->status = IN_USE;
-            head->next = NULL;
+            head->next = IN_USE;
 
             spin_release(&mid_locks[idx]);
             return (void*)(head + 1);
@@ -355,7 +346,7 @@ int my_free(void* ptr) {
         return -1;
     }
 
-    if(obj->status == FREE){
+    if(obj->next != IN_USE){
         return -1;
     }
 
@@ -380,7 +371,6 @@ int my_free(void* ptr) {
             spin_release(&tiny_locks[idx]);
         }
 
-        obj->status = FREE;
         obj->next = tcache->tiny_bins[idx];
         tcache->tiny_bins[idx] = obj;
     }
@@ -401,7 +391,6 @@ int my_free(void* ptr) {
             spin_release(&small_locks[idx]);
         }
 
-        obj->status = FREE;
         obj->next = tcache->small_bins[idx];
         tcache->small_bins[idx] = obj;
     }
@@ -423,7 +412,6 @@ int my_free(void* ptr) {
             spin_release(&mid_locks[idx]);
         }
 
-        obj->status = FREE;
         obj->next = tcache->mid_bins[idx];
         tcache->mid_bins[idx] = obj;
     }
@@ -458,13 +446,19 @@ void* my_realloc(void* ptr, unsigned long new_size) {
     if(ptr == NULL) {
         return my_malloc(new_size);
     }
+
     if(new_size == 0) {
         my_free(ptr);
         return NULL;
     }
+
     new_size = ALIGN16(new_size);
     object_metadata* obj = get_object_ptr(ptr);
-    
+
+    if(obj->next != IN_USE) {
+        my_free(ptr);
+    }
+
     if(obj->size > MY_MMAP_TRESHOLD) {
         object_metadata* new_obj = my_mremap(obj, sizeof(object_metadata) + obj->size, sizeof(object_metadata) + new_size, MY_MREMAP_MAYMOVE);
 
@@ -473,7 +467,7 @@ void* my_realloc(void* ptr, unsigned long new_size) {
         }
 
         new_obj->size = new_size;
-        new_obj->status = IN_USE;
+        new_obj->next = IN_USE;
         return (void*)(obj + 1);
     }
 
@@ -493,5 +487,4 @@ void* my_realloc(void* ptr, unsigned long new_size) {
     );
     my_free(ptr);
     return new_ptr;
-
 }
