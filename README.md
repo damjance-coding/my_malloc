@@ -6,8 +6,5 @@ It utillizes thread caches for optimal performance
 It provides 4 functions: my_malloc, my_free, my_calloc and my_realloc
 
 # Contributing
-Pool requests are always welcome.
+Pull requests are always welcome.
 
-## License
-
-[MIT](https://choosealicense.com/licenses/mit/)
