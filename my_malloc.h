@@ -19,13 +19,15 @@ void* my_realloc(void* ptr, unsigned long new_size);
 #define TINY_STRIDE 16
 #define TINY_BATCH_SIZE 32
 
-#define NSMALL 28
+// FIX: was 28, but SMALL_END / SMALL_STRIDE = 4096 / 128 = 32
+#define NSMALL 32
 #define SMALL_END 4096  //4KB
 #define SMALL_ARENA_SIZE 262144 //256KB
 #define SMALL_STRIDE 128
 #define SMALL_BATCH_SIZE 16
 
-#define NMID 31
+// FIX: was 31, but MID_END / MID_STRIDE = 131072 / 4096 = 32
+#define NMID 32
 #define MID_END 131072 //128KB
 #define MID_ARENA_SIZE 2000000 //2MB
 #define MID_STRIDE 4096 // 4KB
@@ -137,7 +139,7 @@ object_metadata* carve_arena(void* arena, unsigned long arena_size, unsigned lon
   object_metadata* head = NULL;
   for(unsigned long i = 0; i  < arena_size - metadata_stride; i += metadata_stride) {
     object_metadata* obj = (object_metadata*)((char*)(arena) +i);
-        
+
     obj->size = obj_size;
 
     if(!head) {
@@ -151,7 +153,6 @@ object_metadata* carve_arena(void* arena, unsigned long arena_size, unsigned lon
         obj->next = (object_metadata*)((char*)(arena) + i + metadata_stride);
       }
     }
-        
 
   }
   return head;
@@ -177,7 +178,7 @@ void* my_malloc(unsigned long size) {
   if(size > MY_MMAP_TRESHOLD) {
     object_metadata* lob = my_mmap(NULL, sizeof(object_metadata) + size, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
     // LOB stands for Large OBject
-        
+
     if(lob == MY_MAP_FAILED) {
       return NULL;
     }
@@ -190,20 +191,20 @@ void* my_malloc(unsigned long size) {
 
   // 4. Handle allocations 16-512 bytes
   if(size <= TINY_END) {
-    short idx = size / TINY_STRIDE - 1; // The increment between objects in the tiny_bin is 16b
+    short idx = size / TINY_STRIDE - 1;
     // Check the thread cache first (no need for a spinlock)
     if(tcache->tiny_bins[idx]) {
       object_metadata* sob = tcache->tiny_bins[idx];
 
       tcache->tiny_bins[idx] = sob->next;
-      sob->next = IN_USE; // next now representes the status, if it isnt IN_USE the object is free
+      sob->next = IN_USE;
 
       tcache->tiny_counts[idx]--;
 
       return (void*)(sob+1);
     }
 
-    ///thread cache empty, take from tiny_bins[idx]
+    // Thread cache empty, take from tiny_bins[idx]
     spin_acquire(&tiny_locks[idx]);
     if(tiny_bins[idx]) {
       for(int i = 0; i < TINY_BATCH_SIZE; i++) {
@@ -221,15 +222,15 @@ void* my_malloc(unsigned long size) {
       tcache->tiny_bins[idx] = head->next;
       head->next = IN_USE;
 
-      tcache->tiny_counts[idx] = TINY_BATCH_SIZE -1;
+      tcache->tiny_counts[idx] = TINY_BATCH_SIZE - 1;
 
       spin_release(&tiny_locks[idx]);
       return (void*)(head + 1);
     }
 
     spin_release(&tiny_locks[idx]);
-    void* arena= my_mmap(NULL, TINY_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
-        
+    void* arena = my_mmap(NULL, TINY_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+
     if(arena == MY_MAP_FAILED) {
       return NULL;
     }
@@ -248,20 +249,21 @@ void* my_malloc(unsigned long size) {
       sob->next = tcache->tiny_bins[idx];
       tcache->tiny_bins[idx] = sob;
     }
+    object_metadata* obj_to_return = tcache->tiny_bins[idx];
+    tcache->tiny_bins[idx] = obj_to_return->next;
 
-    tcache->tiny_counts[idx] = TINY_BATCH_SIZE;
-
-    head->next = IN_USE;
+    obj_to_return->next = IN_USE;
+    tcache->tiny_counts[idx] = TINY_BATCH_SIZE - 1;
 
     spin_release(&tiny_locks[idx]);
-    return (void*)(head + 1);
+    return (void*)(obj_to_return + 1);
   }
 
   // 5. Handle allocations 528-4KB
   else if (size <= SMALL_END) {
 
-    short idx = size / SMALL_STRIDE - 1; // The increment between objects in the small_bin is 128b
-        
+    short idx = size / SMALL_STRIDE - 1;
+
     if(tcache->small_bins[idx]) {
       object_metadata* sob = tcache->small_bins[idx];
 
@@ -279,33 +281,32 @@ void* my_malloc(unsigned long size) {
           object_metadata* sob = small_bins[idx];
           if(sob == NULL) break;
 
-          small_bins[idx] = sob-> next;
+          small_bins[idx] = sob->next;
 
           sob->next = tcache->small_bins[idx];
           tcache->small_bins[idx] = sob;
         }
 
         object_metadata* head = tcache->small_bins[idx];
-                
+
         tcache->small_bins[idx] = head->next;
         head->next = IN_USE;
 
-        tcache->small_counts[idx] = SMALL_BATCH_SIZE -1;
+        tcache->small_counts[idx] = SMALL_BATCH_SIZE - 1;
 
         spin_release(&small_locks[idx]);
         return (void*)(head + 1);
-            
       }
 
       spin_release(&small_locks[idx]);
-      void* arena= my_mmap(NULL, SMALL_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
-        
+      void* arena = my_mmap(NULL, SMALL_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+
       if(arena == MY_MAP_FAILED) {
         return NULL;
       }
 
       object_metadata* head = carve_arena(arena, SMALL_ARENA_SIZE, size);
-            
+
       spin_acquire(&small_locks[idx]);
       small_bins[idx] = head;
 
@@ -320,19 +321,22 @@ void* my_malloc(unsigned long size) {
         tcache->small_bins[idx] = sob;
       }
 
-      tcache->small_counts[idx] = SMALL_BATCH_SIZE;
-
-      head->next = IN_USE;
+      // FIX: was setting head->next = IN_USE while head was still in tcache,
+      // corrupting the list. Pop it properly like the tiny path does.
+      object_metadata* obj_to_return = tcache->small_bins[idx];
+      tcache->small_bins[idx] = obj_to_return->next;
+      obj_to_return->next = IN_USE;
+      tcache->small_counts[idx] = SMALL_BATCH_SIZE - 1;
 
       spin_release(&small_locks[idx]);
-      return (void*)(head + 1);
+      return (void*)(obj_to_return + 1);
     }
   }
 
-  //6. Handle allocations 4KB - 128KB
+  // 6. Handle allocations 4KB - 128KB
   else if(size <= MID_END) {
-    short idx = size / MID_STRIDE - 1; // The increment between objects in the mid_bin is 4kb
-        
+    short idx = size / MID_STRIDE - 1;
+
     if(tcache->mid_bins[idx]) {
       object_metadata* sob = tcache->mid_bins[idx];
 
@@ -343,7 +347,6 @@ void* my_malloc(unsigned long size) {
 
       return (void*)(sob + 1);
     }
-        
 
     else {
       spin_acquire(&mid_locks[idx]);
@@ -351,9 +354,9 @@ void* my_malloc(unsigned long size) {
         for(int i = 0; i < MID_BATCH_SIZE; i++) {
           object_metadata* sob = mid_bins[idx];
           if(sob == NULL) break;
-                    
+
           mid_bins[idx] = sob->next;
-                    
+
           sob->next = tcache->mid_bins[idx];
           tcache->mid_bins[idx] = sob;
         }
@@ -369,8 +372,8 @@ void* my_malloc(unsigned long size) {
       }
 
       spin_release(&mid_locks[idx]);
-      void* arena= my_mmap(NULL, MID_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
-            
+      void* arena = my_mmap(NULL, MID_ARENA_SIZE, MY_PROT_READ | MY_PROT_WRITE, MY_MAP_PRIVATE | MY_MAP_ANONYMOUS, -1, 0);
+
       if(arena == MY_MAP_FAILED) {
         return NULL;
       }
@@ -390,11 +393,15 @@ void* my_malloc(unsigned long size) {
         tcache->mid_bins[idx] = sob;
       }
 
-      tcache->mid_counts[idx] = MID_BATCH_SIZE;
-      head->next = IN_USE;
+      // FIX: same as small — was corrupting tcache list by setting head->next = IN_USE
+      // without first popping head out of tcache.
+      object_metadata* obj_to_return = tcache->mid_bins[idx];
+      tcache->mid_bins[idx] = obj_to_return->next;
+      obj_to_return->next = IN_USE;
+      tcache->mid_counts[idx] = MID_BATCH_SIZE - 1;
 
       spin_release(&mid_locks[idx]);
-      return (void*)(head + 1);
+      return (void*)(obj_to_return + 1);
     }
   }
 
@@ -406,7 +413,7 @@ int my_free(void* ptr) {
   if(ptr == NULL) {
     return -1;
   }
-    
+
   object_metadata* obj = get_object_ptr(ptr);
   if(obj == NULL) {
     return -1;
@@ -434,11 +441,15 @@ int my_free(void* ptr) {
         sob->next = tiny_bins[idx];
         tiny_bins[idx] = sob;
       }
+      // FIX: was missing — count never decremented after flush, causing the
+      // flush condition to trigger again immediately on next free with too few objects
+      tcache->tiny_counts[idx] -= TINY_BATCH_SIZE * 2;
       spin_release(&tiny_locks[idx]);
     }
 
     obj->next = tcache->tiny_bins[idx];
     tcache->tiny_bins[idx] = obj;
+    tcache->tiny_counts[idx]++;
   }
   else if (obj->size <= SMALL_END) {
     short idx = obj->size / SMALL_STRIDE - 1;
@@ -454,16 +465,19 @@ int my_free(void* ptr) {
         sob->next = small_bins[idx];
         small_bins[idx] = sob;
       }
+      // FIX: was missing count decrement after flush
+      tcache->small_counts[idx] -= SMALL_BATCH_SIZE * 2;
       spin_release(&small_locks[idx]);
     }
 
     obj->next = tcache->small_bins[idx];
     tcache->small_bins[idx] = obj;
+    // FIX: was tcache->tiny_counts[idx]++
+    tcache->small_counts[idx]++;
   }
   else if (obj->size <= MID_END) {
     short idx = obj->size / MID_STRIDE - 1;
-        
-        
+
     int count = tcache->mid_counts[idx];
     if(count >= MID_BATCH_SIZE * 2) {
       spin_acquire(&mid_locks[idx]);
@@ -475,13 +489,17 @@ int my_free(void* ptr) {
         sob->next = mid_bins[idx];
         mid_bins[idx] = sob;
       }
+      // FIX: was missing count decrement after flush
+      tcache->mid_counts[idx] -= MID_BATCH_SIZE * 2;
       spin_release(&mid_locks[idx]);
     }
 
     obj->next = tcache->mid_bins[idx];
     tcache->mid_bins[idx] = obj;
+    // FIX: was tcache->tiny_counts[idx]++
+    tcache->mid_counts[idx]++;
   }
-    
+
   return 0;
 }
 
@@ -492,12 +510,14 @@ void* my_calloc(unsigned long nmemb, unsigned long size) {
   }
   void* ptr = my_malloc(total_size);
   if(ptr == NULL) return NULL;
-  //1. Optimize for blocks allocated via mmap dirrectly, we can skip them
+  // 1. Optimize for blocks allocated via mmap directly — kernel already zeroes them
   object_metadata* obj = get_object_ptr(ptr);
   if(obj->size > MY_MMAP_TRESHOLD) return ptr;
 
-  //2. Zero any other objects
-  unsigned long qwords = total_size / 8;
+  // 2. Zero any other objects.
+  // FIX: was using total_size / 8 which truncates and misses up to 7 bytes for
+  // unaligned sizes. Use obj->size which is already ALIGN16'd, so always divisible by 8.
+  unsigned long qwords = obj->size / 8;
 
   void* ptr_before_inline = ptr;
   __asm__ __volatile__(
